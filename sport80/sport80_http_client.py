@@ -121,10 +121,26 @@ class SportEightyHTTP:
         """ Fetches the event index per year """
         api_url = urljoin(self.domain_env['RANKINGS_DOMAIN_URL'], EndPoint.EVENT_INDEX.value)
         payload = {"date_range_start": f"{year}-01-01", "date_range_end": f"{year}-12-31"}
+        print(f"Fetching events for {year} with payload:", payload)
+        
         get_page = self.http_session.post(api_url, headers=self.standard_headers, json=payload)
+        if not get_page.ok:
+            print(f"Error fetching events: {get_page.status_code}")
+            return {}
+            
+        response = get_page.json()
+        print(f"Total events: {response.get('total', 'unknown')}")
+        print(f"Items per page: {response.get('items_per_page', 'unknown')}")
+        print(f"Current page: {response.get('current_page', 'unknown')}")
+        
         if get_page.ok:
-            page_data = self.__collate_results(get_page.json(), payload)
+            page_data = self.__collate_results(response, payload)
+            print(f"Number of pages collected: {len(page_data)}")
+            for page_num, page in page_data.items():
+                print(f"Page {page_num} has {len(page.get('data', []))} events")
+            
             collated_index = collate_index(page_data)
+            print(f"Total events after collation: {len(collated_index)}")
             return collated_index
 
     def get_event_results(self, event_dict: dict):
@@ -145,16 +161,31 @@ class SportEightyHTTP:
         all_pages = {0: page_one}
         current_page = page_one
         index = 1
-        while current_page['next_page_url'] is not None:
-            all_pages[index] = current_page = self.__next_page(current_page['next_page_url'], payload)
-            index = index + 1
+        
+        while current_page.get('next_page_url'):
+            print(f"Fetching page {index} from {current_page['next_page_url']}")
+            next_page = self.__next_page(current_page['next_page_url'], payload)
+            if not next_page:
+                print(f"Failed to fetch page {index}")
+                break
+                
+            all_pages[index] = next_page
+            current_page = next_page
+            index += 1
+            
         return all_pages
 
-    def __next_page(self, next_url: str, payload: dict) -> dict:
+    def __next_page(self, next_url: str, payload: Optional[dict] = None) -> Optional[dict]:
         """ Designed around the events dict """
-        get_page = self.http_session.post(next_url, headers=self.standard_headers, json=payload)
-        if get_page.ok:
-            return get_page.json()
+        try:
+            get_page = self.http_session.post(next_url, headers=self.standard_headers, json=payload)
+            if get_page.ok:
+                return get_page.json()
+            print(f"Error fetching next page: {get_page.status_code}")
+            return None
+        except Exception as e:
+            print(f"Exception fetching next page: {e}")
+            return None
 
     def get_lifter_data(self, lifter_id):
         """ Historical performance of a lifter  """
