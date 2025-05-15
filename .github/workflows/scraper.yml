@@ -1,9 +1,9 @@
-name: Sport80 Scraper
+name: Sport80 to Supabase
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # Runs every day at 2am UTC
-  workflow_dispatch:      # Allows manual runs from the GitHub UI
+    - cron: '0 2 * * *'  # Every day at 2am UTC
+  workflow_dispatch:
 
 jobs:
   run-scraper:
@@ -21,8 +21,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Run update script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python test_sport80.py
+        run: python update_supabase_from_sport80.py
