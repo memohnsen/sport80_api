@@ -249,7 +249,7 @@ def main():
 
     sport80_api = SportEighty(subdomain=USAW_DOMAIN, return_dict=True, debug=logging.WARNING)
     # Keeping num_events=1 for this test, can be changed back to 30 later.
-    recent_sport80_events_data = fetch_recent_events_from_sport80(sport80_api, num_events=1)
+    recent_sport80_events_data = fetch_recent_events_from_sport80(sport80_api, num_events=20)
 
     if not recent_sport80_events_data:
         logging.info("No recent events fetched from Sport80. Exiting.")
