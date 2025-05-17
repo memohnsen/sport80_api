@@ -77,50 +77,49 @@ def parse_event_date(event_data_dict):
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def fetch_existing_data_from_supabase() -> tuple:
-    """Fetch existing event IDs and meet names from the Supabase database."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logging.error("Supabase URL or Key not configured.")
-        return set(), set()
+def filter_already_existing_event_ids(candidate_event_ids: list[str]) -> set[str]:
+    """Given a list of candidate event IDs, query Supabase to find which ones already exist."""
+    if not candidate_event_ids:
+        logging.info("No candidate event IDs provided to check for existence.")
+        return set()
 
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE_NAME}?select=event_id,{SUPABASE_MEET_NAME_COLUMN}"
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logging.error("Supabase URL or Key not configured for checking event IDs.")
+        return set() # Or raise an error
+
+    # Format for the "in" clause: (id1,id2,id3)
+    # Supabase/PostgREST expects a comma-separated list for the `in` filter.
+    # Ensure IDs are quoted if they are strings, but event_id seems to be stored as text/string non-quoted in db based on logs.
+    # The event_ids extracted are already strings.
+    event_ids_str = ",".join(candidate_event_ids)
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE_NAME}?select=event_id&event_id=in.({event_ids_str})"
+    
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Accept": "application/json" # Explicitly ask for JSON
     }
+    
+    existing_ids_in_db = set()
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
+        logging.info(f"Querying Supabase for existing event_ids: {candidate_event_ids}")
+        resp = requests.get(url, headers=headers, timeout=45)
+        resp.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
         
-        event_ids = set()
-        meet_names = set()
-        
-        logging.info("Fetching existing data from Supabase...")
-        data_from_db = resp.json()
-        if not data_from_db:
-            logging.info("No existing data found in Supabase table.")
-            return set(), set()
-
-        for i, row in enumerate(data_from_db):
-            event_id_val = row.get("event_id")
-            if event_id_val: # Ensure it's not None or empty
-                event_ids.add(str(event_id_val).strip()) # Ensure string and strip whitespace
-                if i < 5: # Log first 5 event_ids loaded
-                    logging.info(f"  Loaded event_id from DB: '{str(event_id_val).strip()}' (type: {type(str(event_id_val).strip())})")
-            
-            meet_name_val = row.get(SUPABASE_MEET_NAME_COLUMN)
-            if meet_name_val:
-                meet_names.add(str(meet_name_val).lower().strip())
-        
-        logging.info(f"Loaded {len(event_ids)} unique event IDs and {len(meet_names)} unique meet names from database (after processing)")
-        return event_ids, meet_names
-        
+        results = resp.json()
+        for row in results:
+            if "event_id" in row and row["event_id"]:
+                existing_ids_in_db.add(str(row["event_id"]).strip())
+        logging.info(f"Supabase check found {len(existing_ids_in_db)} existing event IDs: {existing_ids_in_db}")
+        return existing_ids_in_db
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching existing data from Supabase: {e}")
-        return set(), set()
+        logging.error(f"Error querying Supabase for existing event IDs: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Supabase response content for event_id check: {e.response.text}")
+        return set() # Return empty set on error, so script might try to re-add
     except ValueError: # JSONDecodeError
-        logging.error(f"Error decoding JSON from Supabase: {resp.text if resp else 'No response'}")
-        return set(), set()
+        logging.error(f"Error decoding JSON from Supabase event_id check: {resp.text if resp else 'No response'}")
+        return set()
 
 
 def add_meet_results_to_supabase(results_to_insert: list):
@@ -248,132 +247,125 @@ def main():
         logging.critical("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set. Exiting.")
         return
 
-    event_ids, meet_names = fetch_existing_data_from_supabase()
-    logging.info(f"Found {len(event_ids)} unique event IDs and {len(meet_names)} unique meet names in Supabase.")
-    
-    # Fetch the highest existing ID to ensure we don't create duplicates
-    max_id = fetch_max_id_from_supabase()
-    next_id = max_id + 1
-    logging.info(f"Highest existing ID in database: {max_id}. Next ID will be: {next_id}")
-
-    # Initialize SportEighty client
-    # Set debug in SportEighty to logging.DEBUG for more verbose output from the client if needed
-    # Note: Your library uses print() for some debugs, which won't be controlled by this logging level.
     sport80_api = SportEighty(subdomain=USAW_DOMAIN, return_dict=True, debug=logging.WARNING)
+    # Keeping num_events=1 for this test, can be changed back to 30 later.
+    recent_sport80_events_data = fetch_recent_events_from_sport80(sport80_api, num_events=1)
 
-    recent_events_from_sport80 = fetch_recent_events_from_sport80(sport80_api, num_events=1)
-    if not recent_events_from_sport80:
+    if not recent_sport80_events_data:
         logging.info("No recent events fetched from Sport80. Exiting.")
         return
-    logging.info(f"Fetched {len(recent_events_from_sport80)} most recent event items from Sport80.")
+    logging.info(f"Fetched {len(recent_sport80_events_data)} event(s) from Sport80.")
 
-    new_events_processed_count = 0
-    for event_data in recent_events_from_sport80:
-        # Extract meet name - prioritize 'columns' then direct key
-        meet_name = get_nested_value(event_data, "name", "Event") or \
-                    get_nested_value(event_data, "title") or \
-                    get_nested_value(event_data, "meet") # Add this line to check for 'meet' field
-
-        # Extract a unique event identifier for your DB (if needed beyond meet_name)
-        # The library uses event_data['action'][0]['route'].split('/')[-1] as an internal ID.
-        # You might use event_data.get('id') if it's a stable display ID.
-        db_event_id_str = None
+    candidate_event_details = []
+    for event_data_item in recent_sport80_events_data:
+        meet_name = get_nested_value(event_data_item, "meet") # Primary source for meet name from Sport80
+        event_id_str = "N/A"
         try:
-            # Ensure the extracted ID is a string and stripped of whitespace
-            db_event_id_str = str(event_data['action'][0]['route'].split('/')[-1]).strip()
+            event_id_str = str(event_data_item['action'][0]['route'].split('/')[-1]).strip()
         except (KeyError, IndexError, TypeError):
-            db_event_id_str = str(event_data.get("id", "N/A")).strip()
-
-        logging.info(f"Processing event: name='{meet_name}', db_event_id_str='{db_event_id_str}' (type: {type(db_event_id_str)})")
-
+            # Fallback if the primary path for event_id is not found
+            event_id_from_data = event_data_item.get("id") # sport80 library might put it here
+            if event_id_from_data:
+                event_id_str = str(event_id_from_data).strip()
+        
         if not meet_name:
-            logging.warning(f"Skipping event due to missing name. Event ID: {db_event_id_str}. Data (first 100 chars): {str(event_data)[:100]}")
+            logging.warning(f"Event data missing 'meet' field. Event ID: {event_id_str}. Data: {str(event_data_item)[:200]}")
+            # Decide if you want to skip or use a placeholder for meet_name
+            # meet_name = f"Unknown Meet (ID: {event_id_str})" # Example placeholder
+            # For now, let's rely on later checks to skip if name is truly essential elsewhere
+
+        if event_id_str != "N/A":
+            candidate_event_details.append({"id": event_id_str, "name": meet_name, "data": event_data_item})
+        else:
+            logging.warning(f"Could not extract a valid event_id for event: {meet_name if meet_name else 'Name N/A'}. Data: {str(event_data_item)[:200]}")
+
+    if not candidate_event_details:
+        logging.info("No valid candidate events with IDs to process after initial parsing. Exiting.")
+        return
+
+    candidate_ids_to_check_in_db = [details["id"] for details in candidate_event_details]
+    
+    # Query Supabase for which of these candidate IDs already exist
+    already_existing_event_ids_in_db = filter_already_existing_event_ids(candidate_ids_to_check_in_db)
+    logging.info(f"Checked {len(candidate_ids_to_check_in_db)} candidate event IDs. Found {len(already_existing_event_ids_in_db)} existing in DB: {already_existing_event_ids_in_db}")
+
+    max_id_in_db = fetch_max_id_from_supabase()
+    next_id_for_new_rows = max_id_in_db + 1
+    logging.info(f"Highest existing primary ID in Supabase table: {max_id_in_db}. Next row ID will start from: {next_id_for_new_rows}")
+
+    processed_event_ids_this_run = set() # To prevent re-processing if Sport80 API sends duplicates in one batch
+    new_events_added_count = 0
+
+    for event_details in candidate_event_details:
+        current_event_id = event_details["id"]
+        current_meet_name = event_details["name"]
+        event_data_for_api = event_details["data"]
+
+        logging.info(f"Processing candidate: Meet Name='{current_meet_name}', Event ID='{current_event_id}'")
+
+        if not current_meet_name: # Final check for meet name
+            logging.warning(f"Skipping event with ID '{current_event_id}' due to missing meet name after all parsing attempts.")
             continue
 
-        # Check for duplicates, prioritizing event ID checking first as it's more reliable
-        is_event_id_in_db = db_event_id_str in event_ids
-        logging.info(f"Is event_id '{db_event_id_str}' in loaded event_ids set? {is_event_id_in_db}")
-        if is_event_id_in_db:
-            logging.info(f"Meet with ID '{db_event_id_str}' already exists in Supabase (ID match). Skipping.")
+        if current_event_id in already_existing_event_ids_in_db:
+            logging.info(f"Event ID '{current_event_id}' ('{current_meet_name}') already exists in Supabase (checked via DB query). Skipping.")
             continue
-            
-        # Also check by name as a backup
-        is_meet_name_in_db = meet_name.lower().strip() in meet_names
-        logging.info(f"Is meet_name '{meet_name.lower().strip()}' in loaded meet_names set? {is_meet_name_in_db}")
-        if is_meet_name_in_db:
-            logging.info(f"Meet '{meet_name}' already exists in Supabase (name match). Skipping.")
+        
+        if current_event_id in processed_event_ids_this_run:
+            logging.info(f"Event ID '{current_event_id}' ('{current_meet_name}') was already processed in this script run. Skipping.")
             continue
 
-        logging.info(f"Processing new meet: '{meet_name}' (Event ID for DB: {db_event_id_str})")
-
-        detailed_results_list = fetch_meet_results_from_sport80(sport80_api, event_data)
+        logging.info(f"Treating as new meet for DB: '{current_meet_name}' (Event ID: {current_event_id})")
+        
+        detailed_results_list = fetch_meet_results_from_sport80(sport80_api, event_data_for_api)
 
         if not detailed_results_list:
-            logging.info(f"No detailed results found or fetched for meet: '{meet_name}'.")
-            # Optional: Add meet_name to meet_names to prevent re-check if it truly has no results
-            # meet_names.add(meet_name) # Be cautious with this if results might appear later
+            logging.warning(f"No detailed results found/fetched for '{current_meet_name}' (ID: {current_event_id}). Adding ID to processed list to prevent re-check this run.")
+            processed_event_ids_this_run.add(current_event_id)
             continue
 
         formatted_results_for_supabase = []
-        meet_date_obj = parse_event_date(event_data)
+        meet_date_obj = parse_event_date(event_data_for_api)
         meet_date_for_db = meet_date_obj.strftime("%Y-%m-%d") if meet_date_obj > datetime.min.replace(tzinfo=timezone.utc) else None
 
         for result_item in detailed_results_list:
-            # Extract data for each field, checking 'columns' then direct keys
-            # Adjust these keys based on actual data structure from your Sport80 instance
-            lifter_name = get_nested_value(result_item, "lifter", "Athlete") or \
-                          get_nested_value(result_item, "name", "Name")
-            age_cat = get_nested_value(result_item, "age_category", "Age Category") or \
-                      get_nested_value(result_item, "age", "Age") # 'age' is from your old script
-            body_w = get_nested_value(result_item, "body_weight_kg", "Bodyweight") or \
-                     get_nested_value(result_item, "body_weight_(kg)") # from your old script
-
+            lifter_name = get_nested_value(result_item, "lifter", "Athlete") or get_nested_value(result_item, "name", "Name")
+            age_cat = get_nested_value(result_item, "age_category", "Age Category") or get_nested_value(result_item, "age", "Age")
+            body_w = get_nested_value(result_item, "body_weight_kg", "Bodyweight") or get_nested_value(result_item, "body_weight_(kg)")
             sn1 = get_nested_value(result_item, "snatch_lift_1", "Snatch 1")
             sn2 = get_nested_value(result_item, "snatch_lift_2", "Snatch 2")
             sn3 = get_nested_value(result_item, "snatch_lift_3", "Snatch 3")
             best_sn = get_nested_value(result_item, "best_snatch", "Best Snatch")
-            
-            cj1 = get_nested_value(result_item, "cj_lift_1", "Clean & Jerk 1") or \
-                  get_nested_value(result_item, "c&j_lift_1") # from your old script
-            cj2 = get_nested_value(result_item, "cj_lift_2", "Clean & Jerk 2") or \
-                  get_nested_value(result_item, "c&j_lift_2")
-            cj3 = get_nested_value(result_item, "cj_lift_3", "Clean & Jerk 3") or \
-                  get_nested_value(result_item, "c&j_lift_3")
-            best_cj = get_nested_value(result_item, "best_cj", "Best Clean & Jerk") or \
-                      get_nested_value(result_item, "best_c&j")
-
+            cj1 = get_nested_value(result_item, "cj_lift_1", "Clean & Jerk 1") or get_nested_value(result_item, "c&j_lift_1")
+            cj2 = get_nested_value(result_item, "cj_lift_2", "Clean & Jerk 2") or get_nested_value(result_item, "c&j_lift_2")
+            cj3 = get_nested_value(result_item, "cj_lift_3", "Clean & Jerk 3") or get_nested_value(result_item, "c&j_lift_3")
+            best_cj = get_nested_value(result_item, "best_cj", "Best Clean & Jerk") or get_nested_value(result_item, "best_c&j")
             total_lifted = get_nested_value(result_item, "total", "Total")
 
             formatted_results_for_supabase.append({
-                "id": next_id,  # Use the next available ID
-                "event_id": db_event_id_str,
-                SUPABASE_MEET_NAME_COLUMN: meet_name,
+                "id": next_id_for_new_rows,
+                "event_id": current_event_id,
+                SUPABASE_MEET_NAME_COLUMN: current_meet_name,
                 "date": meet_date_for_db,
                 "name": lifter_name,
-                "age": age_cat, # Changed from 'age_category' to 'age' to match the database schema
+                "age": age_cat,
                 "body_weight": body_w,
-                "snatch1": sn1,
-                "snatch2": sn2,
-                "snatch3": sn3,
-                "snatch_best": best_sn,
-                "cj1": cj1,
-                "cj2": cj2,
-                "cj3": cj3,
-                "cj_best": best_cj,
+                "snatch1": sn1, "snatch2": sn2, "snatch3": sn3, "snatch_best": best_sn,
+                "cj1": cj1, "cj2": cj2, "cj3": cj3, "cj_best": best_cj,
                 "total": total_lifted,
             })
-            next_id += 1  # Increment the ID for the next record
+            next_id_for_new_rows += 1
 
         if formatted_results_for_supabase:
             add_meet_results_to_supabase(formatted_results_for_supabase)
-            new_events_processed_count += 1
-            # Add to sets to prevent re-processing in this run
-            meet_names.add(meet_name.lower())
-            event_ids.add(db_event_id_str)
+            new_events_added_count += 1
+            logging.info(f"Successfully added {len(formatted_results_for_supabase)} results for '{current_meet_name}' (ID: {current_event_id}).")
         else:
-            logging.info(f"No results formatted for Supabase for meet: '{meet_name}'.")
+            logging.warning(f"No results formatted for Supabase for meet: '{current_meet_name}' (ID: {current_event_id}).")
+        
+        processed_event_ids_this_run.add(current_event_id) # Add here after attempting to process
 
-    logging.info(f"Finished Sport80 to Supabase sync. Processed and attempted to add results for {new_events_processed_count} new meets.")
+    logging.info(f"Finished Sport80 to Supabase sync. Added results for {new_events_added_count} new meet(s).")
 
 if __name__ == "__main__":
     main()
