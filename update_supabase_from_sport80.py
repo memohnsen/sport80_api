@@ -23,6 +23,9 @@ SUPABASE_MEET_NAME_COLUMN = "meet"
 # Sport80 Configuration
 USAW_DOMAIN = "https://usaweightlifting.sport80.com"
 
+# Discord Configuration
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+
 # --- Logging Setup ---
 # GitHub Actions will capture stdout/stderr, so basic config is usually fine.
 # The sport80 library also has its own logging/print statements.
@@ -240,6 +243,32 @@ def fetch_max_id_from_supabase() -> int:
         return 0
 
 
+def send_discord_notification(meets_added_count: int):
+    """Send a Discord notification with the number of meets added and timestamp."""
+    if not DISCORD_WEBHOOK_URL:
+        logging.info("Discord webhook URL not configured. Skipping notification.")
+        return
+
+    # Get current timestamp in a readable format
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    # Create the message
+    message = f"{meets_added_count} Meets Added to Supabase at {current_time}"
+    
+    payload = {
+        "content": message
+    }
+    
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        response.raise_for_status()
+        logging.info(f"Discord notification sent successfully: {message}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to send Discord notification: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Discord webhook response: {e.response.text}")
+
+
 def main():
     logging.info("Starting Sport80 to Supabase sync process...")
 
@@ -366,6 +395,9 @@ def main():
         processed_event_ids_this_run.add(current_event_id) # Add here after attempting to process
 
     logging.info(f"Finished Sport80 to Supabase sync. Added results for {new_events_added_count} new meet(s).")
+
+    # Send Discord notification
+    send_discord_notification(new_events_added_count)
 
 if __name__ == "__main__":
     main()
