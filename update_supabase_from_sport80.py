@@ -243,8 +243,8 @@ def fetch_max_id_from_supabase() -> int:
         return 0
 
 
-def send_discord_notification(meets_added_count: int):
-    """Send a Discord notification with the number of meets added and timestamp."""
+def send_discord_notification(added_meet_names: list[str]):
+    """Send a Discord notification with the names of meets added and timestamp."""
     if not DISCORD_WEBHOOK_URL:
         logging.info("Discord webhook URL not configured. Skipping notification.")
         return
@@ -253,7 +253,13 @@ def send_discord_notification(meets_added_count: int):
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     
     # Create the message
-    message = f"{meets_added_count} Meets Added to Supabase at {current_time}"
+    if not added_meet_names:
+        message = f"No new meets added to Supabase at {current_time}"
+    elif len(added_meet_names) == 1:
+        message = f"1 Meet Added to Supabase at {current_time}:\n• {added_meet_names[0]}"
+    else:
+        meet_list = "\n".join([f"• {name}" for name in added_meet_names])
+        message = f"{len(added_meet_names)} Meets Added to Supabase at {current_time}:\n{meet_list}"
     
     payload = {
         "content": message
@@ -323,7 +329,7 @@ def main():
     logging.info(f"Highest existing primary ID in Supabase table: {max_id_in_db}. Next row ID will start from: {next_id_for_new_rows}")
 
     processed_event_ids_this_run = set() # To prevent re-processing if Sport80 API sends duplicates in one batch
-    new_events_added_count = 0
+    added_meet_names = []  # Track the names of meets that were successfully added
 
     for event_details in candidate_event_details:
         current_event_id = event_details["id"]
@@ -387,17 +393,17 @@ def main():
 
         if formatted_results_for_supabase:
             add_meet_results_to_supabase(formatted_results_for_supabase)
-            new_events_added_count += 1
+            added_meet_names.append(current_meet_name)  # Add the meet name to our list
             logging.info(f"Successfully added {len(formatted_results_for_supabase)} results for '{current_meet_name}' (ID: {current_event_id}).")
         else:
             logging.warning(f"No results formatted for Supabase for meet: '{current_meet_name}' (ID: {current_event_id}).")
         
         processed_event_ids_this_run.add(current_event_id) # Add here after attempting to process
 
-    logging.info(f"Finished Sport80 to Supabase sync. Added results for {new_events_added_count} new meet(s).")
+    logging.info(f"Finished Sport80 to Supabase sync. Added results for {len(added_meet_names)} new meet(s).")
 
-    # Send Discord notification
-    send_discord_notification(new_events_added_count)
+    # Send Discord notification with meet names
+    send_discord_notification(added_meet_names)
 
 if __name__ == "__main__":
     main()
